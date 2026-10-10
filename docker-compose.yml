@@ -1,0 +1,10 @@
+services:
+  index-translate-proxy:
+    build: .
+    image: index-translate-proxy:latest
+    container_name: index-translate-proxy
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    # 默认命令为 --serve --host 0.0.0.0; 需要自定义端口或上游地址时覆盖 command
+    # command: ["--serve", "--host", "0.0.0.0", "--port", "8080", "--api-base", "https://index-translate.bilibili.com/v1"]
