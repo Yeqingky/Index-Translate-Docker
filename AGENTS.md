@@ -25,5 +25,6 @@ go run . --serve --port 18080
 
 - 默认监听 `127.0.0.1:8080`; 仅在明确需要时使用 `--host 0.0.0.0`.
 - 上游地址默认为 `https://index-translate.bilibili.com/v1`, 通过 `--api-base` 覆盖.
-- 代理行为需与 `call_api.py --serve` 保持一致: 路径映射, CORS 响应头, `enable_thinking=false` 与 `temperature=0` 默认值, 上游错误状态码与响应体透传.
+- 代理行为与 `call_api.py --serve` 保持一致: 路径映射, CORS 响应头, `enable_thinking=false` 与 `temperature=0` 默认值, 上游错误状态码与响应体透传.
+- 额外能力: 非流式 `/v1/chat/completions` 收到上游 504 时以流式重试并组装响应; 上游网关对约 10 秒静默的请求返回 504.
 - 修改代理行为时同步更新 `main_test.go` 与本文件.

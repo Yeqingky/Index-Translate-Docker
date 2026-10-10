@@ -9,6 +9,7 @@
 - 为浏览器扩展补充 CORS 响应头, 并响应 `/v1/models` 与就绪探测.
 - 默认注入 `enable_thinking=false`, 客户端未指定 `temperature` 时固定为 `0`, 避免思维链输出替代译文.
 - 上游响应与错误状态码原样透传, 支持 SSE 流式输出.
+- 非流式 `/v1/chat/completions` 收到上游 504 (网关超时) 时, 自动改用流式重试并把流组装回标准响应.
 
 ## 快速开始
 
@@ -57,6 +58,7 @@ docker compose up -d --build
 
 - 代理不鉴权, 默认仅监听回环地址. 确认需要对局域网或公网开放时再使用 `--host 0.0.0.0`, 并自行限制来源.
 - 上游是免费公共 API, 使用前请阅读 Index-Translate 项目的说明与条款.
+- 免费 API 的网关对约 10 秒内没有响应数据的请求返回 504, 长文本非流式请求会触发; 代理通过流式重试自动规避, 客户端无需支持流式.
 - 本项目是对 `bilibili/Index-Translate` (Apache-2.0) 中 `call_api.py` 代理行为的 Go 重写, 未包含其代码副本.
 
 ## License

@@ -6,9 +6,16 @@
 // it on the LAN) and forwards /chat/completions, /completions and /responses
 // requests upstream, adding the CORS headers, User-Agent and thinking-off
 // defaults that browser extensions such as Immersive Translate rely on.
+//
+// Beyond the Python reference, a non-streaming /chat/completions request that
+// hits the upstream gateway timeout (504) is retried once in streaming mode
+// and reassembled into a regular response: the free public API drops any
+// request whose origin stays silent for about ten seconds, which streaming
+// avoids by keeping data flowing.
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -30,6 +37,10 @@ import (
 const (
 	defaultAPIBase = "https://index-translate.bilibili.com/v1"
 	upstreamAgent  = "Index-Translate-Client/1.0"
+
+	// maxAssemblyBytes bounds how much of a retried SSE stream is buffered
+	// while reassembling a non-streaming response.
+	maxAssemblyBytes = 16 << 20
 )
 
 func main() {
@@ -198,7 +209,11 @@ func (p *proxy) handlePost(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadGateway, err)
 		return
 	}
-	body = applyDefaults(body)
+	body, payload, parsed := prepareRequestBody(body)
+	streamRequested := false
+	if parsed {
+		streamRequested, _ = payload["stream"].(bool)
+	}
 
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, p.apiBase+upstreamPath, bytes.NewReader(body))
 	if err != nil {
@@ -214,6 +229,23 @@ func (p *proxy) handlePost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer resp.Body.Close()
+
+	// The upstream gateway returns 504 when the origin stays silent for about
+	// ten seconds, which non-streaming requests exceeding that budget always
+	// trigger. Retry those once in streaming mode, which keeps data flowing,
+	// and reassemble the stream into a regular response.
+	if resp.StatusCode == http.StatusGatewayTimeout && !streamRequested && parsed && upstreamPath == "/chat/completions" {
+		errBody, _ := io.ReadAll(resp.Body)
+		if assembled, ok := p.retryAsStream(r.Context(), payload, upstreamPath); ok {
+			writeAssembled(w, assembled)
+			return
+		}
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(resp.StatusCode)
+		_, _ = w.Write(errBody)
+		return
+	}
 
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 
@@ -235,16 +267,18 @@ func (p *proxy) handlePost(w http.ResponseWriter, r *http.Request) {
 	streamBody(w, resp.Body)
 }
 
-// applyDefaults mirrors the Python proxy: thinking stays disabled unless the
-// client explicitly asks for it, and greedy decoding is pinned when the client
-// omits the temperature. Bodies that are not JSON objects pass through untouched.
-func applyDefaults(body []byte) []byte {
+// prepareRequestBody applies the Python proxy defaults: thinking stays disabled
+// unless the client explicitly asks for it, and greedy decoding is pinned when
+// the client omits the temperature. It also returns the parsed payload so the
+// caller can inspect and rewrite it; bodies that are not JSON objects pass
+// through untouched.
+func prepareRequestBody(body []byte) ([]byte, map[string]any, bool) {
 	if !utf8.Valid(body) {
-		return body
+		return body, nil, false
 	}
 	var payload map[string]any
 	if err := json.Unmarshal(body, &payload); err != nil || payload == nil {
-		return body
+		return body, nil, false
 	}
 	kwargs, ok := payload["chat_template_kwargs"].(map[string]any)
 	if !ok {
@@ -259,9 +293,156 @@ func applyDefaults(body []byte) []byte {
 	}
 	normalized, err := json.Marshal(payload)
 	if err != nil {
-		return body
+		return body, nil, false
 	}
-	return normalized
+	return normalized, payload, true
+}
+
+// retryAsStream repeats a request with streaming enabled and reassembles the
+// SSE stream into a regular chat completion response.
+func (p *proxy) retryAsStream(ctx context.Context, payload map[string]any, upstreamPath string) ([]byte, bool) {
+	retry := make(map[string]any, len(payload)+2)
+	for key, value := range payload {
+		retry[key] = value
+	}
+	retry["stream"] = true
+	if _, ok := retry["stream_options"]; !ok {
+		retry["stream_options"] = map[string]any{"include_usage": true}
+	}
+	body, err := json.Marshal(retry)
+	if err != nil {
+		return nil, false
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.apiBase+upstreamPath, bytes.NewReader(body))
+	if err != nil {
+		return nil, false
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", upstreamAgent)
+
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return nil, false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return nil, false
+	}
+	assembled, err := assembleChatCompletion(resp.Body)
+	if err != nil {
+		return nil, false
+	}
+	fmt.Fprintf(os.Stderr, "[%s] upstream 504 on %s; retried with stream and reassembled the response\n",
+		time.Now().Format("2006-01-02 15:04:05"), upstreamPath)
+	return assembled, true
+}
+
+type streamChunk struct {
+	ID                string `json:"id"`
+	Model             string `json:"model"`
+	Created           int64  `json:"created"`
+	SystemFingerprint string `json:"system_fingerprint"`
+	Choices           []struct {
+		Delta struct {
+			Content string `json:"content"`
+		} `json:"delta"`
+		FinishReason *string `json:"finish_reason"`
+	} `json:"choices"`
+	Usage json.RawMessage `json:"usage"`
+}
+
+type assemblyMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+type assemblyChoice struct {
+	Index        int             `json:"index"`
+	Message      assemblyMessage `json:"message"`
+	FinishReason string          `json:"finish_reason"`
+}
+
+// assembleChatCompletion folds a chat.completions SSE stream into a single
+// non-streaming response body.
+func assembleChatCompletion(stream io.Reader) ([]byte, error) {
+	scanner := bufio.NewScanner(stream)
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+
+	var content strings.Builder
+	var meta streamChunk
+	var finishReason string
+	var usage json.RawMessage
+	read := 0
+	for scanner.Scan() {
+		line := scanner.Text()
+		read += len(line)
+		if read > maxAssemblyBytes {
+			return nil, errors.New("streamed response exceeds the assembly budget")
+		}
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		data := line[len("data: "):]
+		if data == "[DONE]" {
+			break
+		}
+		var chunk streamChunk
+		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			continue
+		}
+		if meta.ID == "" {
+			meta = chunk
+		}
+		if len(chunk.Choices) > 0 {
+			content.WriteString(chunk.Choices[0].Delta.Content)
+			if reason := chunk.Choices[0].FinishReason; reason != nil {
+				finishReason = *reason
+			}
+		}
+		if len(chunk.Usage) > 0 && string(chunk.Usage) != "null" {
+			usage = chunk.Usage
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	if meta.ID == "" {
+		return nil, errors.New("streamed response carried no chunks")
+	}
+	if finishReason == "" {
+		finishReason = "stop"
+	}
+
+	assembled := struct {
+		ID                string           `json:"id"`
+		Object            string           `json:"object"`
+		Created           int64            `json:"created"`
+		Model             string           `json:"model"`
+		SystemFingerprint string           `json:"system_fingerprint,omitempty"`
+		Choices           []assemblyChoice `json:"choices"`
+		Usage             json.RawMessage  `json:"usage,omitempty"`
+	}{
+		ID:                meta.ID,
+		Object:            "chat.completion",
+		Created:           meta.Created,
+		Model:             meta.Model,
+		SystemFingerprint: meta.SystemFingerprint,
+		Choices: []assemblyChoice{{
+			Index:        0,
+			Message:      assemblyMessage{Role: "assistant", Content: content.String()},
+			FinishReason: finishReason,
+		}},
+		Usage: usage,
+	}
+	return json.Marshal(assembled)
+}
+
+func writeAssembled(w http.ResponseWriter, body []byte) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body)
 }
 
 func streamBody(w http.ResponseWriter, body io.Reader) {
