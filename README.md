@@ -26,23 +26,18 @@ go build -o index-translate-proxy .
 ### Docker
 
 ```sh
-docker build -t index-translate-proxy .
-docker run -d --name index-translate-proxy -p 8080:8080 --restart unless-stopped index-translate-proxy
+docker run -d --name index-translate-proxy -p 8080:8080 --restart unless-stopped ghcr.io/yeqingky/index-translate-docker:latest
 ```
 
 ### Docker Compose
 
 ```sh
-docker compose up -d --build
+docker compose up -d
 ```
 
 ### GHCR 镜像
 
 GitHub Actions 在分支 push 和 `v*.*.*` tag push 时构建并推送 `linux/amd64` 与 `linux/arm64` 多架构镜像. 普通提交使用 7 位提交短 SHA 作为镜像 tag; 符合 `vX.Y.Z` 的 tag 发布 `X.Y.Z` 与 `latest`. Pull request 只构建验证, 不推送镜像; 工作流不会创建 GitHub Release. 镜像发布到 GHCR, 使用 Actions 自带的 `GITHUB_TOKEN`; 首次发布后可在 package 设置中将可见性改为 Public.
-
-```sh
-docker run -d --name index-translate-proxy -p 8080:8080 --restart unless-stopped ghcr.io/yeqingky/index-translate-docker:latest
-```
 
 ### 沉浸式翻译配置
 

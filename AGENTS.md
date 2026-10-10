@@ -9,7 +9,7 @@ Index-Translate-Docker 是 bilibili/Index-Translate 免费公共 API 的本地�
 - `main.go`: 代理实现, 包含参数解析, 请求转发, CORS 响应头与默认值注入.
 - `main_test.go`: 代理行为测试, 使用 httptest 伪上游, 不访问真实网络.
 - `Dockerfile`: 多阶段构建, 容器内以 `--serve --host 0.0.0.0` 启动.
-- `docker-compose.yml`: 本地构建镜像并发布 `8080` 端口.
+- `docker-compose.yml`: 使用 GHCR 镜像并发布 `8080` 端口.
 - `README.md`: 使用说明.
 - `.github/workflows/docker.yml`: 构建并推送 GHCR 多架构镜像, 标签规则见 "镜像发布".
 

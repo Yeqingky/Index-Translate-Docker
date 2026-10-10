@@ -1,7 +1,6 @@
 services:
   index-translate-proxy:
-    build: .
-    image: index-translate-proxy:latest
+    image: ghcr.io/yeqingky/index-translate-docker:latest
     container_name: index-translate-proxy
     restart: unless-stopped
     ports:
