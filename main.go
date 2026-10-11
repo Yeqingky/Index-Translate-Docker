@@ -7,11 +7,12 @@
 // requests upstream, adding the CORS headers, User-Agent and thinking-off
 // defaults that browser extensions such as Immersive Translate rely on.
 //
-// Beyond the Python reference, a non-streaming /chat/completions request that
-// hits the upstream gateway timeout (504) is retried once in streaming mode
-// and reassembled into a regular response: the free public API drops any
-// request whose origin stays silent for about ten seconds, which streaming
-// avoids by keeping data flowing.
+// Beyond the Python reference, /chat/completions always talks to the upstream
+// in streaming mode: the free public API answers 504 when its origin stays
+// silent for about ten seconds, and streaming keeps data flowing. Clients that
+// did not ask for a stream receive the SSE stream reassembled into a regular
+// response, and failed attempts are retried a few times before the last
+// failure is handed to the client.
 package main
 
 import (
@@ -38,10 +39,22 @@ const (
 	defaultAPIBase = "https://index-translate.bilibili.com/v1"
 	upstreamAgent  = "Index-Translate-Client/1.0"
 
-	// maxAssemblyBytes bounds how much of a retried SSE stream is buffered
+	// maxUpstreamAttempts bounds how many upstream requests one client request
+	// may trigger: the initial attempt plus three retries.
+	maxUpstreamAttempts = 4
+
+	// defaultRetryDelay pauses between attempts so a flapping upstream is not
+	// hammered with back-to-back requests.
+	defaultRetryDelay = 500 * time.Millisecond
+
+	// maxAssemblyBytes bounds how much of a streamed response is buffered
 	// while reassembling a non-streaming response.
 	maxAssemblyBytes = 16 << 20
 )
+
+// errAssemblyBudget marks a streamed response that grew past maxAssemblyBytes.
+// A retry cannot shrink it, so the proxy reports the failure instead.
+var errAssemblyBudget = errors.New("streamed response exceeds the assembly budget")
 
 func main() {
 	fs := flag.NewFlagSet("index-translate-proxy", flag.ExitOnError)
@@ -112,13 +125,15 @@ func printBanner(host string, port int, apiBase string) {
 
 // proxy implements the OpenAI-compatible bridge.
 type proxy struct {
-	apiBase string
-	client  *http.Client
+	apiBase    string
+	client     *http.Client
+	retryDelay time.Duration
 }
 
 func newProxy(apiBase string) *proxy {
 	return &proxy{
-		apiBase: strings.TrimRight(apiBase, "/"),
+		apiBase:    strings.TrimRight(apiBase, "/"),
+		retryDelay: defaultRetryDelay,
 		client: &http.Client{
 			// The Python reference applies a 120 s timeout to every socket
 			// operation. Approximate it with dial and response-header timeouts
@@ -210,53 +225,29 @@ func (p *proxy) handlePost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	body, payload, parsed := prepareRequestBody(body)
-	streamRequested := false
-	if parsed {
-		streamRequested, _ = payload["stream"].(bool)
-	}
 
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, p.apiBase+upstreamPath, bytes.NewReader(body))
-	if err != nil {
-		writeJSONError(w, http.StatusBadGateway, err)
+	// /chat/completions runs through its own attempt loop: it always calls the
+	// upstream in streaming mode and reassembles the stream for clients that
+	// did not ask for one.
+	if upstreamPath == "/chat/completions" && parsed {
+		p.handleChatCompletion(w, r, payload)
 		return
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", upstreamAgent)
 
-	resp, err := p.client.Do(req)
+	resp, err := p.postUpstream(r.Context(), upstreamPath, body)
 	if err != nil {
 		writeJSONError(w, http.StatusBadGateway, err)
 		return
 	}
 	defer resp.Body.Close()
 
-	// The upstream gateway returns 504 when the origin stays silent for about
-	// ten seconds, which non-streaming requests exceeding that budget always
-	// trigger. Retry those once in streaming mode, which keeps data flowing,
-	// and reassemble the stream into a regular response.
-	if resp.StatusCode == http.StatusGatewayTimeout && !streamRequested && parsed && upstreamPath == "/chat/completions" {
+	if resp.StatusCode >= 400 {
 		errBody, _ := io.ReadAll(resp.Body)
-		if assembled, ok := p.retryAsStream(r.Context(), payload, upstreamPath); ok {
-			writeAssembled(w, assembled)
-			return
-		}
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(resp.StatusCode)
-		_, _ = w.Write(errBody)
+		writeUpstreamError(w, resp.StatusCode, errBody)
 		return
 	}
 
 	w.Header().Set("Access-Control-Allow-Origin", "*")
-
-	if resp.StatusCode >= 400 {
-		errBody, _ := io.ReadAll(resp.Body)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(resp.StatusCode)
-		_, _ = w.Write(errBody)
-		return
-	}
-
 	if ct := resp.Header.Get("Content-Type"); ct != "" {
 		w.Header().Set("Content-Type", ct)
 	}
@@ -265,6 +256,18 @@ func (p *proxy) handlePost(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(resp.StatusCode)
 	streamBody(w, resp.Body)
+}
+
+// postUpstream sends a JSON body to an upstream path with the headers the
+// upstream expects.
+func (p *proxy) postUpstream(ctx context.Context, path string, body []byte) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.apiBase+path, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", upstreamAgent)
+	return p.client.Do(req)
 }
 
 // prepareRequestBody applies the Python proxy defaults: thinking stays disabled
@@ -298,43 +301,171 @@ func prepareRequestBody(body []byte) ([]byte, map[string]any, bool) {
 	return normalized, payload, true
 }
 
-// retryAsStream repeats a request with streaming enabled and reassembles the
-// SSE stream into a regular chat completion response.
-func (p *proxy) retryAsStream(ctx context.Context, payload map[string]any, upstreamPath string) ([]byte, bool) {
-	retry := make(map[string]any, len(payload)+2)
-	for key, value := range payload {
-		retry[key] = value
-	}
-	retry["stream"] = true
-	if _, ok := retry["stream_options"]; !ok {
-		retry["stream_options"] = map[string]any{"include_usage": true}
-	}
-	body, err := json.Marshal(retry)
-	if err != nil {
-		return nil, false
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.apiBase+upstreamPath, bytes.NewReader(body))
-	if err != nil {
-		return nil, false
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", upstreamAgent)
+// handleChatCompletion serves /chat/completions through the attempt loop.
+//
+// Every upstream call is made in streaming mode: the free public API's gateway
+// answers 504 when the origin stays silent for about ten seconds, and keeping
+// data flowing avoids exactly that. Clients that asked for a stream receive the
+// SSE bytes as they arrive; clients that did not receive the stream reassembled
+// into a regular response body.
+//
+// A failed attempt is retried while attempts remain and the failure looks
+// transient: connection errors, a response carrying no usable data, and the
+// retryableStatus codes. Retries happen before any byte reaches the client,
+// since a committed stream cannot be replayed. When every attempt fails, the
+// client sees the last failure.
+func (p *proxy) handleChatCompletion(w http.ResponseWriter, r *http.Request, payload map[string]any) {
+	clientStream, _ := payload["stream"].(bool)
 
-	resp, err := p.client.Do(req)
+	upstreamBody, err := json.Marshal(streamRequestPayload(payload))
 	if err != nil {
-		return nil, false
+		writeJSONError(w, http.StatusBadGateway, err)
+		return
 	}
+
+	var (
+		lastStatus int
+		lastBody   []byte
+		lastErr    error
+	)
+	for attempt := 1; attempt <= maxUpstreamAttempts; attempt++ {
+		if attempt > 1 {
+			if !sleepContext(r.Context(), p.retryDelay) {
+				return // the client is gone; there is nobody left to answer
+			}
+			reason := "unknown failure"
+			switch {
+			case lastStatus != 0:
+				reason = "HTTP " + strconv.Itoa(lastStatus)
+			case lastErr != nil:
+				reason = lastErr.Error()
+			}
+			logUpstreamEventf("/chat/completions attempt %d/%d failed (%s); retrying",
+				attempt-1, maxUpstreamAttempts, reason)
+		}
+
+		resp, err := p.postUpstream(r.Context(), "/chat/completions", upstreamBody)
+		if err != nil {
+			lastStatus, lastBody, lastErr = 0, nil, err
+			continue
+		}
+		if resp.StatusCode >= 400 {
+			errBody, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			lastStatus, lastBody, lastErr = resp.StatusCode, errBody, nil
+			if !retryableStatus(resp.StatusCode) {
+				writeUpstreamError(w, resp.StatusCode, errBody)
+				return
+			}
+			continue
+		}
+		if clientStream {
+			if err := pipeStream(w, resp); err != nil {
+				lastStatus, lastBody, lastErr = 0, nil, err
+				continue
+			}
+			return
+		}
+		assembled, err := assembleChatCompletion(resp.Body)
+		resp.Body.Close()
+		if err == nil {
+			writeAssembled(w, assembled)
+			return
+		}
+		if errors.Is(err, errAssemblyBudget) {
+			writeJSONError(w, http.StatusBadGateway, err)
+			return
+		}
+		lastStatus, lastBody, lastErr = 0, nil, err
+	}
+
+	logUpstreamEventf("/chat/completions gave up after %d attempts", maxUpstreamAttempts)
+	if lastStatus != 0 {
+		writeUpstreamError(w, lastStatus, lastBody)
+		return
+	}
+	writeJSONError(w, http.StatusBadGateway, lastErr)
+}
+
+// streamRequestPayload copies a client payload and switches the upstream call
+// to streaming mode, requesting usage statistics in the final chunk unless the
+// client sent stream_options of its own.
+func streamRequestPayload(payload map[string]any) map[string]any {
+	stream := make(map[string]any, len(payload)+2)
+	for key, value := range payload {
+		stream[key] = value
+	}
+	stream["stream"] = true
+	if _, ok := stream["stream_options"]; !ok {
+		stream["stream_options"] = map[string]any{"include_usage": true}
+	}
+	return stream
+}
+
+// pipeStream forwards a successful streaming response, waiting for the first
+// body byte before committing the response so that an upstream which answers
+// with headers and then closes without data is still reported as a failed
+// attempt and can be retried.
+func pipeStream(w http.ResponseWriter, resp *http.Response) error {
 	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		return nil, false
+
+	body := bufio.NewReader(resp.Body)
+	if _, err := body.Peek(1); err != nil {
+		return fmt.Errorf("upstream closed the stream before sending any data: %w", err)
 	}
-	assembled, err := assembleChatCompletion(resp.Body)
-	if err != nil {
-		return nil, false
+
+	if ct := resp.Header.Get("Content-Type"); ct != "" {
+		w.Header().Set("Content-Type", ct)
 	}
-	fmt.Fprintf(os.Stderr, "[%s] upstream 504 on %s; retried with stream and reassembled the response\n",
-		time.Now().Format("2006-01-02 15:04:05"), upstreamPath)
-	return assembled, true
+	if cc := resp.Header.Get("Cache-Control"); cc != "" {
+		w.Header().Set("Cache-Control", cc)
+	}
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.WriteHeader(resp.StatusCode)
+	streamBody(w, body)
+	return nil
+}
+
+// retryableStatus reports whether an upstream status is worth another attempt:
+// rate limiting and gateway failures are transient, client errors are not.
+func retryableStatus(status int) bool {
+	switch status {
+	case http.StatusTooManyRequests,
+		http.StatusInternalServerError,
+		http.StatusBadGateway,
+		http.StatusServiceUnavailable,
+		http.StatusGatewayTimeout:
+		return true
+	}
+	return false
+}
+
+// sleepContext waits for d unless the client disconnects first. It reports
+// false when there is nobody left to answer.
+func sleepContext(ctx context.Context, d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+// writeUpstreamError forwards an upstream error status and body with the CORS
+// header, declaring JSON like the Python reference does.
+func writeUpstreamError(w http.ResponseWriter, status int, body []byte) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_, _ = w.Write(body)
+}
+
+// logUpstreamEventf writes an operational note to stderr in the same shape as
+// the request log, so retries show up in `docker logs`.
+func logUpstreamEventf(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, "["+time.Now().Format("2006-01-02 15:04:05")+"] "+format+"\n", args...)
 }
 
 type streamChunk struct {
@@ -377,7 +508,7 @@ func assembleChatCompletion(stream io.Reader) ([]byte, error) {
 		line := scanner.Text()
 		read += len(line)
 		if read > maxAssemblyBytes {
-			return nil, errors.New("streamed response exceeds the assembly budget")
+			return nil, errAssemblyBudget
 		}
 		if !strings.HasPrefix(line, "data: ") {
 			continue

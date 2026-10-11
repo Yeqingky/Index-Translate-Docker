@@ -54,10 +54,17 @@ func doRequest(p http.Handler, method, path, body string) *httptest.ResponseReco
 	return rec
 }
 
+// newTestProxy builds a proxy with the retry pause disabled so retry-heavy
+// tests run at full speed.
+func newTestProxy(apiBase string) *proxy {
+	p := newProxy(apiBase)
+	p.retryDelay = 0
+	return p
+}
+
 func TestChatCompletionsInjectsDefaults(t *testing.T) {
-	const upstreamResponse = `{"id":"chatcmpl-1","choices":[{"message":{"content":"Hello, world."}}]}`
-	up := newFakeUpstream(t, http.StatusOK, upstreamResponse)
-	rec := doRequest(newProxy(up.URL), http.MethodPost, "/v1/chat/completions",
+	up := newFakeUpstream(t, http.StatusOK, chatStream)
+	rec := doRequest(newTestProxy(up.URL), http.MethodPost, "/v1/chat/completions",
 		`{"model":"Index-Translate-35B-A3B","messages":[{"role":"user","content":"你好"}]}`)
 
 	if rec.Code != http.StatusOK {
@@ -66,8 +73,8 @@ func TestChatCompletionsInjectsDefaults(t *testing.T) {
 	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "*" {
 		t.Errorf("CORS header = %q, want *", got)
 	}
-	if got := rec.Body.String(); got != upstreamResponse {
-		t.Errorf("response body = %q, want upstream body", got)
+	if got := rec.Body.String(); !strings.Contains(got, `"Hello, world."`) {
+		t.Errorf("response body = %q, want the reassembled stream content", got)
 	}
 
 	path, agent, body := up.received()
@@ -91,8 +98,8 @@ func TestChatCompletionsInjectsDefaults(t *testing.T) {
 }
 
 func TestClientSettingsArePreserved(t *testing.T) {
-	up := newFakeUpstream(t, http.StatusOK, `{}`)
-	doRequest(newProxy(up.URL), http.MethodPost, "/v1/chat/completions",
+	up := newFakeUpstream(t, http.StatusOK, chatStream)
+	doRequest(newTestProxy(up.URL), http.MethodPost, "/v1/chat/completions",
 		`{"model":"m","temperature":0.7,"chat_template_kwargs":{"enable_thinking":true}}`)
 
 	_, _, body := up.received()
@@ -118,7 +125,7 @@ func TestUpstreamPathMatchesRequest(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.want, func(t *testing.T) {
 			up := newFakeUpstream(t, http.StatusOK, `{}`)
-			doRequest(newProxy(up.URL), http.MethodPost, tc.request, `{}`)
+			doRequest(newTestProxy(up.URL), http.MethodPost, tc.request, `{}`)
 			if path, _, _ := up.received(); path != tc.want {
 				t.Errorf("upstream path = %q, want %q", path, tc.want)
 			}
@@ -128,7 +135,7 @@ func TestUpstreamPathMatchesRequest(t *testing.T) {
 
 func TestNonJSONBodyPassesThrough(t *testing.T) {
 	up := newFakeUpstream(t, http.StatusOK, `{}`)
-	doRequest(newProxy(up.URL), http.MethodPost, "/v1/chat/completions", "not json")
+	doRequest(newTestProxy(up.URL), http.MethodPost, "/v1/chat/completions", "not json")
 	if _, _, body := up.received(); body != "not json" {
 		t.Errorf("upstream body = %q, want unchanged", body)
 	}
@@ -158,7 +165,7 @@ func TestModelsEndpoint(t *testing.T) {
 }
 
 func TestReadyResponse(t *testing.T) {
-	rec := doRequest(newProxy("http://127.0.0.1:1"), http.MethodGet, "/", "")
+	rec := doRequest(newTestProxy("http://127.0.0.1:1"), http.MethodGet, "/", "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
@@ -171,7 +178,7 @@ func TestReadyResponse(t *testing.T) {
 }
 
 func TestOptionsPreflight(t *testing.T) {
-	rec := doRequest(newProxy("http://127.0.0.1:1"), http.MethodOptions, "/v1/chat/completions", "")
+	rec := doRequest(newTestProxy("http://127.0.0.1:1"), http.MethodOptions, "/v1/chat/completions", "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
@@ -189,7 +196,7 @@ func TestOptionsPreflight(t *testing.T) {
 }
 
 func TestUnknownPostPathReturns404(t *testing.T) {
-	rec := doRequest(newProxy("http://127.0.0.1:1"), http.MethodPost, "/v1/embeddings", `{}`)
+	rec := doRequest(newTestProxy("http://127.0.0.1:1"), http.MethodPost, "/v1/embeddings", `{}`)
 	if rec.Code != http.StatusNotFound {
 		t.Errorf("status = %d, want 404", rec.Code)
 	}
@@ -198,7 +205,7 @@ func TestUnknownPostPathReturns404(t *testing.T) {
 func TestUpstreamErrorIsForwarded(t *testing.T) {
 	const errBody = `{"error":{"message":"rate limited"}}`
 	up := newFakeUpstream(t, http.StatusTooManyRequests, errBody)
-	rec := doRequest(newProxy(up.URL), http.MethodPost, "/v1/chat/completions", `{}`)
+	rec := doRequest(newTestProxy(up.URL), http.MethodPost, "/v1/chat/completions", `{}`)
 
 	if rec.Code != http.StatusTooManyRequests {
 		t.Errorf("status = %d, want 429", rec.Code)
@@ -219,7 +226,7 @@ func TestUpstreamFailureReturnsBadGateway(t *testing.T) {
 	url := up.URL
 	up.Close() // the port now refuses connections
 
-	rec := doRequest(newProxy(url), http.MethodPost, "/v1/chat/completions", `{}`)
+	rec := doRequest(newTestProxy(url), http.MethodPost, "/v1/chat/completions", `{}`)
 	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("status = %d, want 502", rec.Code)
 	}
@@ -243,7 +250,7 @@ func TestStreamingResponsePassesThrough(t *testing.T) {
 	}))
 	t.Cleanup(up.Close)
 
-	rec := doRequest(newProxy(up.URL), http.MethodPost, "/v1/chat/completions", `{"stream":true}`)
+	rec := doRequest(newTestProxy(up.URL), http.MethodPost, "/v1/chat/completions", `{"stream":true}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
@@ -305,25 +312,34 @@ func writeSSE(w http.ResponseWriter, payload string) {
 	}
 }
 
-func TestGatewayTimeoutFallsBackToStreaming(t *testing.T) {
-	up := newScriptedUpstream(t,
-		func(w http.ResponseWriter, _ *http.Request) {
-			w.Header().Set("Content-Type", "text/html")
-			w.WriteHeader(http.StatusGatewayTimeout)
-			_, _ = io.WriteString(w, "<html>504 Gateway Time-out</html>")
-		},
-		func(w http.ResponseWriter, _ *http.Request) {
-			w.Header().Set("Content-Type", "text/event-stream")
-			writeSSE(w, `{"id":"chatcmpl-x","created":7,"model":"m","system_fingerprint":"f","object":"chat.completion.chunk","choices":[{"index":0,"finish_reason":null,"delta":{"role":"assistant","content":null}}]}`)
-			writeSSE(w, `{"id":"chatcmpl-x","created":7,"model":"m","system_fingerprint":"f","object":"chat.completion.chunk","choices":[{"index":0,"finish_reason":null,"delta":{"content":"Hello"}}]}`)
-			writeSSE(w, `{"id":"chatcmpl-x","created":7,"model":"m","system_fingerprint":"f","object":"chat.completion.chunk","choices":[{"index":0,"finish_reason":null,"delta":{"content":", world."}}]}`)
-			writeSSE(w, `{"id":"chatcmpl-x","created":7,"model":"m","system_fingerprint":"f","object":"chat.completion.chunk","choices":[{"index":0,"finish_reason":"stop","delta":{}}]}`)
-			writeSSE(w, `{"id":"chatcmpl-x","created":7,"model":"m","object":"chat.completion.chunk","choices":[],"usage":{"completion_tokens":3,"prompt_tokens":5,"total_tokens":8}}`)
-			_, _ = io.WriteString(w, "data: [DONE]\n\n")
-		},
-	)
+// chatStream is a small but complete chat.completions SSE stream: metadata,
+// two content deltas, a finish reason and usage statistics.
+const chatStream = `data: {"id":"chatcmpl-x","created":7,"model":"m","system_fingerprint":"f","object":"chat.completion.chunk","choices":[{"index":0,"finish_reason":null,"delta":{"role":"assistant","content":null}}]}
 
-	rec := doRequest(newProxy(up.URL), http.MethodPost, "/v1/chat/completions",
+data: {"id":"chatcmpl-x","created":7,"model":"m","object":"chat.completion.chunk","choices":[{"index":0,"finish_reason":null,"delta":{"content":"Hello"}}]}
+
+data: {"id":"chatcmpl-x","created":7,"model":"m","object":"chat.completion.chunk","choices":[{"index":0,"finish_reason":null,"delta":{"content":", world."}}]}
+
+data: {"id":"chatcmpl-x","created":7,"model":"m","object":"chat.completion.chunk","choices":[{"index":0,"finish_reason":"stop","delta":{}}]}
+
+data: {"id":"chatcmpl-x","created":7,"model":"m","object":"chat.completion.chunk","choices":[],"usage":{"completion_tokens":3,"prompt_tokens":5,"total_tokens":8}}
+
+data: [DONE]
+
+`
+
+// chatStreamHandler serves chatStream with the SSE content type.
+func chatStreamHandler() http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, chatStream)
+	}
+}
+
+func TestChatCompletionsAlwaysStreamsUpstream(t *testing.T) {
+	up := newScriptedUpstream(t, chatStreamHandler())
+
+	rec := doRequest(newTestProxy(up.URL), http.MethodPost, "/v1/chat/completions",
 		`{"model":"m","messages":[{"role":"user","content":"hi"}]}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
@@ -371,78 +387,146 @@ func TestGatewayTimeoutFallsBackToStreaming(t *testing.T) {
 	}
 
 	requests := up.receivedRequests()
-	if len(requests) != 2 {
-		t.Fatalf("upstream saw %d requests, want 2", len(requests))
+	if len(requests) != 1 {
+		t.Fatalf("upstream saw %d requests, want 1", len(requests))
 	}
-	var first map[string]any
-	if err := json.Unmarshal([]byte(requests[0].body), &first); err != nil {
-		t.Fatalf("first upstream body is not JSON: %v", err)
+	var sent map[string]any
+	if err := json.Unmarshal([]byte(requests[0].body), &sent); err != nil {
+		t.Fatalf("upstream body is not JSON: %v", err)
 	}
-	if stream, ok := first["stream"].(bool); ok && stream {
-		t.Error("first request already streamed; the fallback must only apply after a 504")
+	if sent["stream"] != true {
+		t.Errorf("upstream stream = %v, want true even for a non-streaming client", sent["stream"])
 	}
-	var retry map[string]any
-	if err := json.Unmarshal([]byte(requests[1].body), &retry); err != nil {
-		t.Fatalf("retry body is not JSON: %v", err)
-	}
-	if retry["stream"] != true {
-		t.Errorf("retry stream = %v, want true", retry["stream"])
-	}
-	if _, ok := retry["stream_options"]; !ok {
-		t.Error("retry carries no stream_options")
+	if _, ok := sent["stream_options"]; !ok {
+		t.Error("upstream body carries no stream_options")
 	}
 }
 
-func TestStreamingClientsAreNotRetried(t *testing.T) {
-	up := newScriptedUpstream(t, func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusGatewayTimeout)
-		_, _ = io.WriteString(w, "timeout")
-	})
-	rec := doRequest(newProxy(up.URL), http.MethodPost, "/v1/chat/completions", `{"model":"m","stream":true,"messages":[]}`)
-	if rec.Code != http.StatusGatewayTimeout {
-		t.Fatalf("status = %d, want 504", rec.Code)
+func TestStreamingClientRetriesBeforeAnyBytes(t *testing.T) {
+	up := newScriptedUpstream(t,
+		func(w http.ResponseWriter, _ *http.Request) {
+			// 200 with SSE headers and no body at all
+			w.Header().Set("Content-Type", "text/event-stream")
+		},
+		chatStreamHandler(),
+	)
+	rec := doRequest(newTestProxy(up.URL), http.MethodPost, "/v1/chat/completions", `{"model":"m","stream":true,"messages":[]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
 	}
-	if got := len(up.receivedRequests()); got != 1 {
-		t.Errorf("upstream saw %d requests, want 1 (no retry for streaming clients)", got)
-	}
-}
-
-func TestFailedRetryReturnsTheOriginalGatewayTimeout(t *testing.T) {
-	gatewayTimeout := func(body string) http.HandlerFunc {
-		return func(w http.ResponseWriter, _ *http.Request) {
-			w.WriteHeader(http.StatusGatewayTimeout)
-			_, _ = io.WriteString(w, body)
-		}
-	}
-	up := newScriptedUpstream(t, gatewayTimeout("first"), gatewayTimeout("second"))
-	rec := doRequest(newProxy(up.URL), http.MethodPost, "/v1/chat/completions", `{"model":"m","messages":[]}`)
-	if rec.Code != http.StatusGatewayTimeout {
-		t.Fatalf("status = %d, want 504", rec.Code)
-	}
-	if got := rec.Body.String(); got != "first" {
-		t.Errorf("body = %q, want the original 504 body", got)
+	if got := rec.Body.String(); got != chatStream {
+		t.Errorf("stream body = %q, want the retried upstream stream", got)
 	}
 	if got := len(up.receivedRequests()); got != 2 {
 		t.Errorf("upstream saw %d requests, want 2", got)
 	}
 }
 
-func TestUnusableRetryStreamReturnsTheOriginalGatewayTimeout(t *testing.T) {
-	up := newScriptedUpstream(t,
-		func(w http.ResponseWriter, _ *http.Request) {
+func TestStreamingClientExhaustionReturnsBadGateway(t *testing.T) {
+	empty := func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+	}
+	up := newScriptedUpstream(t, empty, empty, empty, empty)
+	rec := doRequest(newTestProxy(up.URL), http.MethodPost, "/v1/chat/completions", `{"model":"m","stream":true,"messages":[]}`)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", rec.Code)
+	}
+	if got := len(up.receivedRequests()); got != 4 {
+		t.Errorf("upstream saw %d requests, want 4 (one attempt plus three retries)", got)
+	}
+}
+
+func TestExhaustedAttemptsForwardTheLastUpstreamError(t *testing.T) {
+	gatewayTimeout := func(body string) http.HandlerFunc {
+		return func(w http.ResponseWriter, _ *http.Request) {
 			w.WriteHeader(http.StatusGatewayTimeout)
-			_, _ = io.WriteString(w, "first")
-		},
-		func(w http.ResponseWriter, _ *http.Request) {
-			w.Header().Set("Content-Type", "text/event-stream") // 200 with no usable chunks
-		},
+			_, _ = io.WriteString(w, body)
+		}
+	}
+	up := newScriptedUpstream(t,
+		gatewayTimeout("first"), gatewayTimeout("second"),
+		gatewayTimeout("third"), gatewayTimeout("fourth"),
 	)
-	rec := doRequest(newProxy(up.URL), http.MethodPost, "/v1/chat/completions", `{"model":"m","messages":[]}`)
+	rec := doRequest(newTestProxy(up.URL), http.MethodPost, "/v1/chat/completions", `{"model":"m","messages":[]}`)
 	if rec.Code != http.StatusGatewayTimeout {
 		t.Fatalf("status = %d, want 504", rec.Code)
 	}
-	if got := rec.Body.String(); got != "first" {
-		t.Errorf("body = %q, want the original 504 body", got)
+	if got := rec.Body.String(); got != "fourth" {
+		t.Errorf("body = %q, want the last upstream error body", got)
+	}
+	if got := len(up.receivedRequests()); got != 4 {
+		t.Errorf("upstream saw %d requests, want 4 (one attempt plus three retries)", got)
+	}
+}
+
+func TestNonRetryableStatusIsReturnedImmediately(t *testing.T) {
+	up := newScriptedUpstream(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, `{"error":"bad request"}`)
+	})
+	rec := doRequest(newTestProxy(up.URL), http.MethodPost, "/v1/chat/completions", `{"model":"m","messages":[]}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+	if got := rec.Body.String(); got != `{"error":"bad request"}` {
+		t.Errorf("body = %q, want the upstream error body", got)
+	}
+	if got := len(up.receivedRequests()); got != 1 {
+		t.Errorf("upstream saw %d requests, want 1 (client errors are not retried)", got)
+	}
+}
+
+func TestEmptyStreamAttemptsAreRetried(t *testing.T) {
+	up := newScriptedUpstream(t,
+		func(w http.ResponseWriter, _ *http.Request) {
+			// 200 with SSE headers and no body at all
+			w.Header().Set("Content-Type", "text/event-stream")
+		},
+		func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = io.WriteString(w, "bad gateway")
+		},
+		chatStreamHandler(),
+	)
+	rec := doRequest(newTestProxy(up.URL), http.MethodPost, "/v1/chat/completions", `{"model":"m","messages":[]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if got := rec.Body.String(); !strings.Contains(got, `"Hello, world."`) {
+		t.Errorf("body = %q, want the reassembled stream", got)
+	}
+	if got := len(up.receivedRequests()); got != 3 {
+		t.Errorf("upstream saw %d requests, want 3", got)
+	}
+}
+
+func TestCommittedStreamIsNotRetried(t *testing.T) {
+	up := newScriptedUpstream(t,
+		func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			writeSSE(w, `{"id":"chatcmpl-x","created":7,"model":"m","object":"chat.completion.chunk","choices":[{"index":0,"finish_reason":null,"delta":{"content":"Hel"}}]}`)
+			hijacker, ok := w.(http.Hijacker)
+			if !ok {
+				return
+			}
+			conn, _, err := hijacker.Hijack()
+			if err != nil {
+				return
+			}
+			// Abort mid-stream without terminating the chunked body.
+			_ = conn.Close()
+		},
+		chatStreamHandler(), // must never be reached
+	)
+	rec := doRequest(newTestProxy(up.URL), http.MethodPost, "/v1/chat/completions", `{"model":"m","stream":true,"messages":[]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if got := rec.Body.String(); !strings.Contains(got, "Hel") {
+		t.Errorf("body = %q, want the bytes that arrived before the upstream aborted", got)
+	}
+	if got := len(up.receivedRequests()); got != 1 {
+		t.Errorf("upstream saw %d requests, want 1 (a committed stream cannot be replayed)", got)
 	}
 }
 
@@ -450,7 +534,7 @@ func TestOtherEndpointsAreNotRetriedOn504(t *testing.T) {
 	up := newScriptedUpstream(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusGatewayTimeout)
 	})
-	rec := doRequest(newProxy(up.URL), http.MethodPost, "/v1/completions", `{"model":"m","prompt":"hi"}`)
+	rec := doRequest(newTestProxy(up.URL), http.MethodPost, "/v1/completions", `{"model":"m","prompt":"hi"}`)
 	if rec.Code != http.StatusGatewayTimeout {
 		t.Fatalf("status = %d, want 504", rec.Code)
 	}
