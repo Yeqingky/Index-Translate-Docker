@@ -19,6 +19,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -52,9 +53,10 @@ const (
 	maxAssemblyBytes = 16 << 20
 )
 
-// errAssemblyBudget marks a streamed response that grew past maxAssemblyBytes.
-// A retry cannot shrink it, so the proxy reports the failure instead.
-var errAssemblyBudget = errors.New("streamed response exceeds the assembly budget")
+var (
+	errAssemblyBudget = errors.New("streamed response exceeds the assembly budget")
+	errUnauthorized   = errors.New("unauthorized")
+)
 
 func main() {
 	fs := flag.NewFlagSet("index-translate-proxy", flag.ExitOnError)
@@ -62,26 +64,33 @@ func main() {
 	host := fs.String("host", "127.0.0.1", "interface for --serve to bind (0.0.0.0 exposes it on the LAN)")
 	port := fs.Int("port", 8080, "port for --serve to listen on")
 	apiBase := fs.String("api-base", defaultAPIBase, "upstream Index-Translate API base URL")
+	apiKey := fs.String("key", "", "API key required in Authorization: Bearer header (or API_KEY environment variable)")
 	fs.Usage = func() {
-		fmt.Fprintf(fs.Output(), "Usage: index-translate-proxy --serve [--host 127.0.0.1] [--port 8080] [--api-base URL]\n\n")
+		fmt.Fprintf(fs.Output(), "Usage: index-translate-proxy --serve [--host 127.0.0.1] [--port 8080] [--api-base URL] [-key KEY]\n\n")
 		fs.PrintDefaults()
 	}
 	_ = fs.Parse(os.Args[1:])
+	apiKeyValue := os.Getenv("API_KEY")
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "key" {
+			apiKeyValue = *apiKey
+		}
+	})
 
 	if !*serve {
 		fs.Usage()
 		os.Exit(2)
 	}
-	if err := run(*host, *port, *apiBase); err != nil {
+	if err := run(*host, *port, *apiBase, apiKeyValue); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
 }
 
-func run(host string, port int, apiBase string) error {
+func run(host string, port int, apiBase, apiKey string) error {
 	srv := &http.Server{
 		Addr:              net.JoinHostPort(host, strconv.Itoa(port)),
-		Handler:           logRequests(newProxy(apiBase)),
+		Handler:           logRequests(newProxy(apiBase, apiKey)),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
@@ -119,20 +128,22 @@ func printBanner(host string, port int, apiBase string) {
 	fmt.Println("  1. 翻译服务选择: 自定义 (OpenAI 兼容)")
 	fmt.Printf("  2. 接口地址 (API URL): http://%s:%d/v1\n", displayHost, port)
 	fmt.Println("  3. 模型 (Model): Index-Translate-35B-A3B")
-	fmt.Println("  4. API Key: 随意填写 (如 index)")
+	fmt.Println("  4. API Key: 使用服务端配置的密钥; 未配置时可随意填写")
 	fmt.Println(strings.Repeat("=", 60))
 }
 
 // proxy implements the OpenAI-compatible bridge.
 type proxy struct {
 	apiBase    string
+	apiKey     string
 	client     *http.Client
 	retryDelay time.Duration
 }
 
-func newProxy(apiBase string) *proxy {
+func newProxy(apiBase, apiKey string) *proxy {
 	return &proxy{
 		apiBase:    strings.TrimRight(apiBase, "/"),
+		apiKey:     apiKey,
 		retryDelay: defaultRetryDelay,
 		client: &http.Client{
 			// The Python reference applies a 120 s timeout to every socket
@@ -148,6 +159,12 @@ func newProxy(apiBase string) *proxy {
 }
 
 func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodOptions && p.apiKey != "" && !p.hasValidAPIKey(r) {
+		w.Header().Set("WWW-Authenticate", "Bearer")
+		writeJSONError(w, http.StatusUnauthorized, errUnauthorized)
+		return
+	}
+
 	switch r.Method {
 	case http.MethodOptions:
 		h := w.Header()
@@ -163,6 +180,13 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
+}
+
+func (p *proxy) hasValidAPIKey(r *http.Request) bool {
+	authorization := r.Header.Get("Authorization")
+	scheme, token, ok := strings.Cut(authorization, " ")
+	return ok && strings.EqualFold(scheme, "Bearer") &&
+		subtle.ConstantTimeCompare([]byte(token), []byte(p.apiKey)) == 1
 }
 
 type modelEntry struct {

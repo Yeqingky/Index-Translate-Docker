@@ -47,8 +47,15 @@ func (u *fakeUpstream) received() (path, agent, body string) {
 }
 
 func doRequest(p http.Handler, method, path, body string) *httptest.ResponseRecorder {
+	return doRequestWithAuthorization(p, method, path, body, "")
+}
+
+func doRequestWithAuthorization(p http.Handler, method, path, body, authorization string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(method, path, strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	if authorization != "" {
+		req.Header.Set("Authorization", authorization)
+	}
 	rec := httptest.NewRecorder()
 	p.ServeHTTP(rec, req)
 	return rec
@@ -57,7 +64,7 @@ func doRequest(p http.Handler, method, path, body string) *httptest.ResponseReco
 // newTestProxy builds a proxy with the retry pause disabled so retry-heavy
 // tests run at full speed.
 func newTestProxy(apiBase string) *proxy {
-	p := newProxy(apiBase)
+	p := newProxy(apiBase, "")
 	p.retryDelay = 0
 	return p
 }
@@ -141,8 +148,8 @@ func TestNonJSONBodyPassesThrough(t *testing.T) {
 	}
 }
 
-func TestModelsEndpoint(t *testing.T) {
-	p := newProxy("http://127.0.0.1:1") // upstream is never reached here
+func TestModelsEndpointWithoutConfiguredAPIKey(t *testing.T) {
+	p := newProxy("http://127.0.0.1:1", "") // upstream is never reached here
 	for _, path := range []string{"/v1/models", "/models"} {
 		rec := doRequest(p, http.MethodGet, path, "")
 		if rec.Code != http.StatusOK {
@@ -164,6 +171,56 @@ func TestModelsEndpoint(t *testing.T) {
 	}
 }
 
+func TestAPIKeyRejectsInvalidCredentials(t *testing.T) {
+	tests := []struct {
+		name          string
+		method        string
+		path          string
+		authorization string
+	}{
+		{name: "missing", method: http.MethodPost, path: "/v1/chat/completions"},
+		{name: "wrong", method: http.MethodPost, path: "/v1/chat/completions", authorization: "Bearer wrong"},
+		{name: "wrong scheme", method: http.MethodPost, path: "/v1/chat/completions", authorization: "Basic secret"},
+		{name: "extra token", method: http.MethodPost, path: "/v1/chat/completions", authorization: "Bearer secret extra"},
+		{name: "models endpoint", method: http.MethodGet, path: "/v1/models"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			up := newFakeUpstream(t, http.StatusOK, chatStream)
+			rec := doRequestWithAuthorization(newProxy(up.URL, "secret"), tc.method,
+				tc.path, `{}`, tc.authorization)
+
+			if rec.Code != http.StatusUnauthorized {
+				t.Fatalf("status = %d, want 401", rec.Code)
+			}
+			if got := rec.Header().Get("WWW-Authenticate"); got != "Bearer" {
+				t.Errorf("WWW-Authenticate = %q, want Bearer", got)
+			}
+			if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "*" {
+				t.Errorf("CORS header = %q, want *", got)
+			}
+			if path, _, _ := up.received(); path != "" {
+				t.Errorf("unauthorized request reached upstream path %q", path)
+			}
+		})
+	}
+}
+
+func TestAPIKeyAcceptsMatchingBearerToken(t *testing.T) {
+	up := newFakeUpstream(t, http.StatusOK, chatStream)
+	p := newProxy(up.URL, "secret")
+	p.retryDelay = 0
+	rec := doRequestWithAuthorization(p, http.MethodPost, "/v1/chat/completions",
+		`{"model":"m","messages":[]}`, "bEaReR secret")
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	if path, _, _ := up.received(); path != "/chat/completions" {
+		t.Errorf("upstream path = %q, want /chat/completions", path)
+	}
+}
+
 func TestReadyResponse(t *testing.T) {
 	rec := doRequest(newTestProxy("http://127.0.0.1:1"), http.MethodGet, "/", "")
 	if rec.Code != http.StatusOK {
@@ -178,7 +235,8 @@ func TestReadyResponse(t *testing.T) {
 }
 
 func TestOptionsPreflight(t *testing.T) {
-	rec := doRequest(newTestProxy("http://127.0.0.1:1"), http.MethodOptions, "/v1/chat/completions", "")
+	p := newProxy("http://127.0.0.1:1", "secret")
+	rec := doRequest(p, http.MethodOptions, "/v1/chat/completions", "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}

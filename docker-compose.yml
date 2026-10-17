@@ -5,5 +5,7 @@ services:
     restart: unless-stopped
     ports:
       - "8080:8080"
-    # 默认命令为 --serve --host 0.0.0.0; 需要自定义端口或上游地址时覆盖 command
+    environment:
+      API_KEY: ${API_KEY:-}
+    # 默认命令为 --serve --host 0.0.0.0; 需要自定义端口或上游地址时覆盖 command, 可用 API_KEY 环境变量启用鉴权
     # command: ["--serve", "--host", "0.0.0.0", "--port", "8080", "--api-base", "https://index-translate.bilibili.com/v1"]

@@ -1,4 +1,4 @@
-name: Docker image
+name: Build and release
 
 on:
   push:
@@ -30,6 +30,8 @@ jobs:
   docker:
     name: Build and publish Docker image
     needs: verify
+    outputs:
+      version: ${{ steps.version.outputs.value }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -78,3 +80,35 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  release:
+    name: Publish release binaries
+    if: github.event_name == 'push' && needs.docker.outputs.version != ''
+    needs: docker
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Build release binaries
+        run: |
+          mkdir -p dist
+          GOOS=linux GOARCH=amd64 go build -trimpath -o dist/index-translate-proxy-linux-amd64 .
+          GOOS=linux GOARCH=arm64 go build -trimpath -o dist/index-translate-proxy-linux-arm64 .
+          GOOS=windows GOARCH=amd64 go build -trimpath -o dist/index-translate-proxy-windows-amd64.exe .
+          GOOS=windows GOARCH=arm64 go build -trimpath -o dist/index-translate-proxy-windows-arm64.exe .
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --generate-notes --verify-tag
+          fi
